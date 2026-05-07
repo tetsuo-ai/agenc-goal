@@ -1,0 +1,9 @@
+{
+  "name": "agenc",
+  "version": "0.1.0",
+  "description": "Goal-completion plugin for Claude Code: decomposed objectives with auto-detected gates, reviewer subagent audit, prompt-injection-safe context reflection, iteration cap, and goal abandon.",
+  "author": {
+    "name": "tetsuo-ai"
+  },
+  "homepage": "https://agenc.tech"
+}

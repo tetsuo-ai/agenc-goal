@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agenc-goal": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/goal-server.mjs"],
+      "env": {
+        "AGENC_GOAL_DB_PATH": "${CLAUDE_PLUGIN_DATA}/agenc-goals.json"
+      },
+      "alwaysLoad": true
+    }
+  }
+}

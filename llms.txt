@@ -1,0 +1,87 @@
+# agenc
+
+> Goal-completion plugin for Claude Code. A user objective is decomposed into sequenced subgoals; each subgoal runs on its own git branch, must pass auto-detected gates, and is audited by a reviewer subagent before its branch merges back. Untrusted subprocess output is XML-wrapped before reflection into the agent's context.
+
+`agenc` adds eight things to a Claude Code session:
+
+1. An MCP server (`agenc-goal`) exposing 8 tools: `goal_create`, `goal_get`, `goal_update`, `goal_clear`, `subgoal_list`, `subgoal_get`, `subgoal_start`, `subgoal_complete`. State persists in a JSON file at `~/.agenc/agenc-goals.json`, scoped per project directory (one active goal per cwd), with an O_EXCL lock file for concurrent writers.
+2. A planner subprocess (`claude -p --bare`) that decomposes a user's objective into N sequenced subgoals on `goal_create`. The planner picks any number; cycles in declared dependencies are auto-broken via Kahn's algorithm. Falls back to a single subgoal on parse/auth/timeout failure.
+3. A reviewer subprocess (`claude -p --bare`) invoked from `subgoal_complete`. Audits the subgoal's diff + gate results and returns `APPROVED`, `NEEDS_REVISION`, or `BLOCKED`. Output contract is a `VERDICT:` line within the last 5 non-empty lines; missing or invalid → defaults to `NEEDS_REVISION` (never auto-approve). Both subprocesses check the `is_error` field on the JSON envelope so auth/billing/rate-limit failures don't get swallowed as parser misses.
+4. A gate runner. Auto-detects correctness gates from project markers (`package.json` scripts, `pyproject.toml`, `Cargo.toml`, `go.mod`, `Makefile`) or runs explicit gates from `.agenc/gates.json`. Sequential, fail-fast. Stdout/stderr tail-truncated to keep reviewer payload sane.
+5. Per-subgoal git branch isolation (`agenc-goal/<short>/<sg-N>`). Branch creation + state flip are atomic under the DB lock to prevent two-in-progress and orphan-branch races. On approval, `--no-ff` merge back to the parent branch. No-op when not in a git repo.
+6. A Stop hook that returns `decision="block"` with a state-aware continuation prompt while a subgoal is in progress. Stays sub-100ms — no subprocess work in the hook. All reflected planner/reviewer/objective text wrapped via `lib/text.mjs` `untrusted()` so subprocess output can't inject instructions.
+7. A SessionStart hook that re-injects the active goal + current subgoal's done-criteria + last reviewer verdict into context on session resume. Same untrusted-content wrapping.
+8. The slash command `/agenc:goal <objective>` (with optional `--no-plan` flag to skip decomposition).
+
+## Plugin surface
+
+- [.claude-plugin/plugin.json](.claude-plugin/plugin.json): plugin manifest. `name=agenc`. Hooks and MCP config are auto-discovered from standard paths.
+- [.mcp.json](.mcp.json): MCP server registration (`node bin/goal-server.mjs`, stdio).
+- [hooks/hooks.json](hooks/hooks.json): Stop + SessionStart hook wiring.
+- [bin/goal-server.mjs](bin/goal-server.mjs): MCP server. Inline 5-state subgoal state machine. 8 tools. Iteration cap (`AGENC_GOAL_MAX_ITERATIONS`, default 10) auto-blocks subgoals that spin on NEEDS_REVISION.
+- [lib/db.mjs](lib/db.mjs): JSON store. `withDbLock` (O_EXCL atomic, 30s timeout for orphan-lock recovery), `loadDb`, `saveDb`, `mutateDb`.
+- [lib/text.mjs](lib/text.mjs): `escapeXml`, `untrusted`, `stripControl` — XML-wraps reflected subprocess output to defeat prompt-injection via `</untrusted>` close-tag attacks.
+- [lib/planner.mjs](lib/planner.mjs): decomposition subprocess (`claude -p --bare`). 90s hang timeout (`AGENC_GOAL_PLANNER_TIMEOUT_MS`). `parsePlannerOutput` accepts plain JSON, fenced JSON, and JSON-with-prose. `breakCycles()` clears dep edges that form cycles.
+- [lib/reviewer.mjs](lib/reviewer.mjs): audit subprocess (`claude -p --bare`). 180s hang timeout (`AGENC_GOAL_REVIEWER_TIMEOUT_MS`). Diff truncated at 200KB (`AGENC_GOAL_MAX_DIFF_BYTES`). `parseVerdict` scans up to 5 trailing non-empty lines for the regex.
+- [lib/gate-runner.mjs](lib/gate-runner.mjs): `autoDetectGates`, `loadExplicitGates`, `resolveGates`, `runGates`. Default per-gate timeout 600s (`AGENC_GOAL_GATE_TIMEOUT_MS`); stdout/stderr tail-truncated to 4KB (`AGENC_GOAL_OUTPUT_TAIL_BYTES`).
+- [lib/branch-helper.mjs](lib/branch-helper.mjs): `inGitRepo`, `startSubgoalBranch`, `mergeSubgoalBranch`, `diffSubgoalBranch`. No-op when not git.
+- [commands/goal.md](commands/goal.md): the `/agenc:goal` slash command. Smart-parse — args = create-with-decompose, no args = show status, `--no-plan` = skip decomposition.
+- [scripts/on-stop.mjs](scripts/on-stop.mjs): state-aware continuation. Five branches: v0.1 single-objective audit, in_progress subgoal, blocked subgoal, all-complete, no-eligible.
+- [scripts/on-session-start.mjs](scripts/on-session-start.mjs): resume payload with subgoal status + active subgoal context.
+- [skills/goal/SKILL.md](skills/goal/SKILL.md): workflow doc loaded on trigger.
+- [test/smoke.mjs](test/smoke.mjs): end-to-end test using `AGENC_GOAL_MOCK=1` to short-circuit subprocess calls. Covers happy path, NEEDS_REVISION, branch merge, goal_clear, iteration cap.
+- [test/unit/](test/unit/): unit suites (`node --test`) for db, planner, reviewer, gate-runner, text — 41 tests.
+- [README.md](README.md): human-facing overview.
+- [package.json](package.json): Node manifest. `node >= 20`. One dependency: `@modelcontextprotocol/sdk`.
+
+## Subgoal state machine
+
+```
+pending → [subgoal_start]                  → in_progress
+in_progress → [subgoal_complete]           → review_pending
+review_pending → [gates fail]              → in_progress (synthetic NEEDS_REVISION verdict pushed to history)
+review_pending → [gates pass + APPROVED]   → complete (branch merged into parent)
+review_pending → [NEEDS_REVISION]          → in_progress (reviewer feedback as result)
+review_pending → [BLOCKED or merge fails]  → blocked
+review_pending → [iteration_count > AGENC_GOAL_MAX_ITERATIONS] → blocked
+blocked → [subgoal_start with id]          → in_progress
+complete → terminal
+```
+
+`review_pending` exists only inside the `subgoal_complete` MCP tool call. Once the call returns, status is one of {`in_progress`, `complete`, `blocked`} — there is no stuck-state recovery problem.
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENC_GOAL_DB_PATH` | `~/.agenc/agenc-goals.json` | Storage location |
+| `AGENC_GOAL_MAX_ITERATIONS` | `10` | NEEDS_REVISION cycles before auto-blocked |
+| `AGENC_GOAL_PLANNER_TIMEOUT_MS` | `90000` | Planner subprocess hang detection |
+| `AGENC_GOAL_REVIEWER_TIMEOUT_MS` | `180000` | Reviewer subprocess hang detection |
+| `AGENC_GOAL_GATE_TIMEOUT_MS` | `600000` | Default per-gate hang detection |
+| `AGENC_GOAL_MAX_DIFF_BYTES` | `204800` | Diff size sent to reviewer |
+| `AGENC_GOAL_OUTPUT_TAIL_BYTES` | `4096` | Gate stdout/stderr captured |
+
+All non-storage limits are deadlock-recovery / OOM-prevention thresholds, not policy. Override only if you hit them.
+
+## Mock mode for tests
+
+- `AGENC_GOAL_MOCK=1`: short-circuits planner and reviewer subprocesses.
+- `AGENC_GOAL_MOCK_PLANNER=<path>`: load planner output JSON from a file.
+- `AGENC_GOAL_MOCK_REVIEWER=APPROVED|NEEDS_REVISION|BLOCKED`: hard-coded verdict.
+- `AGENC_GOAL_MOCK_REVIEWER_FILE=<path>`: load verdict + reasoning JSON from a file.
+
+## Install
+
+In a Claude Code session:
+
+```
+/plugin marketplace add tetsuo-ai/agenc-goal
+/plugin install agenc@tetsuo-ai
+```
+
+Then `cd ~/.claude/plugins/agenc && npm install` once (Claude Code does not auto-install npm deps), and `/reload-plugins`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
