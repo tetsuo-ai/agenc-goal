@@ -1,0 +1,19 @@
+{
+  "name": "tetsuo-ai",
+  "owner": {
+    "name": "tetsuo-ai",
+    "email": "tetsuo.solana@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "agenc",
+      "source": {
+        "source": "github",
+        "repo": "tetsuo-ai/agenc-goal"
+      },
+      "description": "Goal-completion plugin for Claude Code: decomposed objectives with auto-detected gates, in-session goal-reviewer subagent audit (no claude -p subprocess), prompt-injection-safe context reflection, iteration cap, and goal abandon.",
+      "version": "0.2.0",
+      "homepage": "https://github.com/tetsuo-ai/agenc-goal"
+    }
+  ]
+}
